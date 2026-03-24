@@ -150,14 +150,19 @@ extract_servers() {
         grep -v '^$'
 }
 
-# Set the global refr_flag based on server name
+# Set the global refr_flag based on server name or URL
 set_referrer() {
     _srv="$1"
+    _url="$2"
     case "$_srv" in
         YourUpload*) refr_flag="--referrer=https://www.yourupload.com/" ;;
         Okru*)       refr_flag="--referrer=https://ok.ru/" ;;
         Maru*)       refr_flag="--referrer=https://my.mail.ru/" ;;
-        *)           refr_flag="--referrer=https://tioanime.com/" ;;
+        Mega*)       refr_flag="" ;;
+        *)
+            _origin=$(printf '%s' "$_url" | grep -oE '^https?://[^/]+')
+            refr_flag="--referrer=${_origin:-https://tioanime.com}/"
+            ;;
     esac
 }
 
@@ -169,29 +174,25 @@ resolve_video_url() {
     _embed_url="$2"
     case "$_srv_name" in
         YourUpload*)
-            # Extract og:video meta tag which has the direct mp4 URL
+            # Extract og:video meta tag or JWPlayer config
             _page=$(curl -s "$_embed_url" -A "$agent" -e "https://tioanime.com/" --max-time 10)
             _direct=$(printf '%s' "$_page" | grep -oP 'og:video"\s+content="\K[^"]+' 2>/dev/null)
-            # Fallback: try file: 'URL' pattern in JWPlayer config
             [ -z "$_direct" ] && _direct=$(printf '%s' "$_page" | grep -oE "file:\s*'https?://[^']+'" | sed "s/file:\s*'//;s/'//" | head -1)
             [ -z "$_direct" ] && _direct=$(printf '%s' "$_page" | grep -oE 'https?://[^"]+\.mp4[^"]*' | head -1)
             printf '%s' "$_direct"
             ;;
-        Okru*)
-            # ok.ru embeds - try yt-dlp as it sometimes works
-            _direct=$(timeout 10 yt-dlp --get-url "$_embed_url" 2>/dev/null | head -1)
-            printf '%s' "$_direct"
-            ;;
-        Maru*)
-            # mail.ru embeds - try yt-dlp
-            _direct=$(timeout 10 yt-dlp --get-url "$_embed_url" 2>/dev/null | head -1)
-            printf '%s' "$_direct"
+        Mega*)
+            # Convert TioAnime embed/!ID!KEY to standard file/ID#KEY
+            _id=$(printf '%s' "$_embed_url" | sed 's|.*/embed/!||;s|!.*||')
+            _key=$(printf '%s' "$_embed_url" | sed 's|.*!||')
+            if [ -n "$_id" ] && [ -n "$_key" ] && [ "$_id" != "$_key" ]; then
+                printf 'https://mega.nz/file/%s#%s' "$_id" "$_key"
+            fi
             ;;
         *)
             # Generic: try to find direct video URL in the embed page
             _page=$(curl -sL "$_embed_url" -A "$agent" -e "https://tioanime.com/" --max-time 10)
-            _direct=$(printf '%s' "$_page" | grep -oE 'https?://[^"]+\.(mp4|m3u8)[^"]*' | head -1)
-            # If no direct URL found, try yt-dlp as last resort
+            _direct=$(printf '%s' "$_page" | grep -oE 'https?://[^"\\]+\.(mp4|m3u8)[^"\\]*' | grep -viE "preview|image|thumb|pixel|favicon" | head -1)
             [ -z "$_direct" ] && _direct=$(timeout 10 yt-dlp --get-url "$_embed_url" 2>/dev/null | head -1)
             printf '%s' "$_direct"
             ;;
@@ -248,7 +249,7 @@ select_server() {
 
     printf "\33[2K\r\033[1;33mResolviendo %s...\033[0m" "$_name"
     episode=$(resolve_video_url "$_name" "$_embed_url")
-    set_referrer "$_name"
+    set_referrer "$_name" "$episode"
 
     if [ -n "$episode" ]; then
         printf "\33[2K\r\033[1;32m¡Cambiado a servidor: %s!\033[0m\n" "$_name"
@@ -280,10 +281,17 @@ get_episode_url() {
     if [ -n "$_result" ]; then
         _server_name=$(printf '%s' "$_result" | cut -f1)
         episode=$(printf '%s' "$_result" | cut -f2)
-        set_referrer "$_server_name"
+        set_referrer "$_server_name" "$episode"
+    else
+        # Final fallback: if no direct link found, use the first available embed URL
+        _first_srv=$(printf '%s' "$server_data" | head -1)
+        _server_name=$(printf '%s' "$_first_srv" | cut -f1)
+        episode=$(printf '%s' "$_first_srv" | cut -f2)
+        set_referrer "$_server_name" "$episode"
+        printf "\33[2K\r\033[1;33mUsando embed (sin resolver): %s\033[0m\n" "$_server_name"
     fi
 
-    [ -z "$episode" ] && die "No se pudo obtener un video directo de ningún servidor."
+    [ -z "$episode" ] && die "No se pudieron encontrar servidores para este episodio."
     printf "\33[2K\r\033[1;32m¡Servidor: %s ✓\033[0m\n" "${_server_name:-Auto}"
 }
 
@@ -325,8 +333,8 @@ process_hist_entry() {
 }
 
 update_history() {
-    if grep -q -- "$id" "$histfile"; then
-        sed -E "s|^[^	]+	${id}	[^	]+$|${ep_no}	${id}	${title}|" "$histfile" >"${histfile}.new"
+    if grep -q -E "\t$id\t" "$histfile"; then
+        sed -E "s|^([^\t]+\t)${id}(\t.*)$|\1${ep_no}\t${id}\2|" "$histfile" >"${histfile}.new"
     else
         cp "$histfile" "${histfile}.new"
         printf "%s\t%s\t%s\n" "$ep_no" "$id" "$title" >>"${histfile}.new"
@@ -560,42 +568,72 @@ esac
 
 # searching
 case "$search" in
-    history)
-        anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
-        wait
-        [ -z "$anime_list" ] && die "No unwatched series in history!"
-        [ -z "${index##*[!0-9]*}" ] && id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: " | cut -f1)
-        [ -z "${index##*[!0-9]*}" ] || id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f1)
-        [ -z "$id" ] && exit 1
-        title=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed 's/ - episode.*//')
-        ep_list=$(episodes_list "$id")
-        ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*- episode (.+)$/\1/p')
-        allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
-        ;;
+        history)
+            anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
+            wait
+            [ -z "$anime_list" ] && die "¡No hay series pendientes en el historial!"
+            if [ -z "${index##*[!0-9]*}" ]; then
+                _entry=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: ")
+            else
+                _entry=$(printf "%s" "$anime_list" | sed -n "${index}p")
+            fi
+            [ -z "$_entry" ] && exit 1
+            id=$(printf "%s" "$_entry" | cut -f1)
+            _title_full=$(printf "%s" "$_entry" | cut -f2)
+            title=$(printf "%s" "$_title_full" | sed 's/ - episode.*//')
+            ep_no=$(printf "%s" "$_title_full" | sed -nE 's/.*- episode (.+)$/\1/p')
+            ep_list=$(episodes_list "$id")
+            allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
+            ;;
     *)
-        if [ "$use_external_menu" = "0" ]; then
-            while [ -z "$query" ]; do
-                printf "\33[2K\r\033[1;36mBuscar anime: \033[0m" && read -r query
-            done
-        else
-            [ -z "$query" ] && query=$(printf "" | external_menu "" "Buscar anime: " "$external_menu_args")
-            [ -z "$query" ] && exit 1
+        if [ "$use_external_menu" = "0" ] && [ -z "$query" ]; then
+            _menu_opt=$(printf "1. Buscar anime\n2. Ver historial" | launcher "" "Seleccionar opción: ")
+            case "$_menu_opt" in
+                *"Ver historial")
+                    search=history
+                    # Re-trigger the history case by setting the variables and jumping or repeating logic
+                    # Since we can't easily GOTO in shell, I'll move history logic to a block here if needed
+                    # but actually, it's better to just re-run the history logic
+                    anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
+                    wait
+                    [ -z "$anime_list" ] && die "¡No hay series pendientes en el historial!"
+                    _entry=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: ")
+                    [ -z "$_entry" ] && exit 1
+                    id=$(printf "%s" "$_entry" | cut -f1)
+                    _title_full=$(printf "%s" "$_entry" | cut -f2)
+                    title=$(printf "%s" "$_title_full" | sed 's/ - episode.*//')
+                    ep_no=$(printf "%s" "$_title_full" | sed -nE 's/.*- episode (.+)$/\1/p')
+                    ep_list=$(episodes_list "$id")
+                    allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
+                    ;;
+                *)
+                    while [ -z "$query" ]; do
+                        printf "\33[2K\r\033[1;36mBuscar anime: \033[0m" && read -r query
+                    done
+                    ;;
+            esac
+        elif [ -z "$query" ] && [ "$search" != "history" ]; then
+             [ -z "$query" ] && query=$(printf "" | external_menu "" "Buscar anime: " "$external_menu_args")
+             [ -z "$query" ] && exit 1
         fi
-        # for checking new releases by specifying anime name
-        [ "$search" = "nextep" ] && time_until_next_ep "$query"
 
-        query=$(printf "%s" "$query" | sed "s| |+|g")
-        anime_list=$(search_anime "$query")
-        [ -z "$anime_list" ] && die "No results found!"
-        [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: ")
-        [ -z "$result" ] && exit 1
-        title=$(printf "%s" "$result" | cut -f2)
-        allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
-        id=$(printf "%s" "$result" | cut -f1)
-        ep_list=$(episodes_list "$id")
-        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Seleccionar episodio: " "$multi_selection_flag")
-        [ -z "$ep_no" ] && exit 1
+        if [ "$search" != "history" ]; then
+            # for checking new releases by specifying anime name
+            [ "$search" = "nextep" ] && time_until_next_ep "$query"
+
+            query=$(printf "%s" "$query" | sed "s| |+|g")
+            anime_list=$(search_anime "$query")
+            [ -z "$anime_list" ] && die "¡No se encontraron resultados!"
+            [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+            [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: ")
+            [ -z "$result" ] && exit 1
+            title=$(printf "%s" "$result" | cut -f2)
+            allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
+            id=$(printf "%s" "$result" | cut -f1)
+            ep_list=$(episodes_list "$id")
+            [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Seleccionar episodio: " "$multi_selection_flag")
+            [ -z "$ep_no" ] && exit 1
+        fi
         ;;
 esac
 [ "$skip_intro" = 1 ] && mal_id="$(ani-skip -q "${skip_title:-${title}}")"
@@ -609,18 +647,18 @@ tput sc
 play
 [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
 
-while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Reproduciendo episodio $ep_no de $title... "); do
+while cmd=$(printf "Siguiente\nRepetir\nAnterior\nSeleccionar episodio\nCambiar servidor\nSalir" | nth "Reproduciendo episodio $ep_no de $title... "); do
     case "$cmd" in
-        next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
-        replay) episode="$replay" ;;
-        previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
-        select) ep_no=$(printf "%s" "$ep_list" | nth "Seleccionar episodio: " "$multi_selection_flag") ;;
-        change_quality)
+        "Siguiente") ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
+        "Repetir") episode="$replay" ;;
+        "Anterior") ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
+        "Seleccionar episodio") ep_no=$(printf "%s" "$ep_list" | nth "Seleccionar episodio: " "$multi_selection_flag") ;;
+        "Cambiar servidor")
             select_server
             ;;
         *) exit 0 ;;
     esac
-    [ -z "$ep_no" ] && die "Out of range"
+    [ -z "$ep_no" ] && die "Fuera de rango"
     play
 done
 
