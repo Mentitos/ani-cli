@@ -138,108 +138,160 @@ where_mpv() {
 
 # SCRAPING
 
-# extract the video links from response of embed urls, extract mp4 links form m3u8 lists
-get_links() {
-    response="$(curl -e "$allanime_refr" -s "https://${allanime_base}$*" -A "$agent")"
-    episode_link="$(printf '%s' "$response" | sed 's|},{|\
-|g' | sed -nE 's|.*link":"([^"]*)".*"resolutionStr":"([^"]*)".*|\2 >\1|p;s|.*hls","url":"([^"]*)".*"hardsub_lang":"en-US".*|\1|p')"
+# Extract servers from TioAnime episode page HTML
+# Input: HTML content via stdin
+# Output: Name\tURL lines
+extract_servers() {
+    sed -n '/var videos =/p' | \
+        sed 's/\],\[/\n/g' | \
+        sed 's/.*\[//;s/\].*//;s/","/ /;s/"//g;s/\\\//\//g' | \
+        awk -F',' '{print $1}' | \
+        sed 's/ /\t/' | \
+        grep -v '^$'
+}
 
-    case "$episode_link" in
-        *repackager.wixmp.com*)
-            extract_link=$(printf "%s" "$episode_link" | cut -d'>' -f2 | sed 's|repackager.wixmp.com/||g;s|\.urlset.*||g')
-            for j in $(printf "%s" "$episode_link" | sed -nE 's|.*/,([^/]*),/mp4.*|\1|p' | sed 's|,|\
-|g'); do
-                printf "%s >%s\n" "$j" "$extract_link" | sed "s|,[^/]*|${j}|g"
-            done | sort -nr
+# Set the global refr_flag based on server name
+set_referrer() {
+    _srv="$1"
+    case "$_srv" in
+        YourUpload*) refr_flag="--referrer=https://www.yourupload.com/" ;;
+        Okru*)       refr_flag="--referrer=https://ok.ru/" ;;
+        Maru*)       refr_flag="--referrer=https://my.mail.ru/" ;;
+        *)           refr_flag="--referrer=https://tioanime.com/" ;;
+    esac
+}
+
+# Try to resolve an embed URL into a direct video URL
+# Returns the direct URL on stdout, or empty if it fails
+# $1 = server name, $2 = embed URL
+resolve_video_url() {
+    _srv_name="$1"
+    _embed_url="$2"
+    case "$_srv_name" in
+        YourUpload*)
+            # Extract og:video meta tag which has the direct mp4 URL
+            _page=$(curl -s "$_embed_url" -A "$agent" -e "https://tioanime.com/" --max-time 10)
+            _direct=$(printf '%s' "$_page" | grep -oP 'og:video"\s+content="\K[^"]+' 2>/dev/null)
+            # Fallback: try file: 'URL' pattern in JWPlayer config
+            [ -z "$_direct" ] && _direct=$(printf '%s' "$_page" | grep -oE "file:\s*'https?://[^']+'" | sed "s/file:\s*'//;s/'//" | head -1)
+            [ -z "$_direct" ] && _direct=$(printf '%s' "$_page" | grep -oE 'https?://[^"]+\.mp4[^"]*' | head -1)
+            printf '%s' "$_direct"
             ;;
-        *master.m3u8*)
-            m3u8_refr=$(printf '%s' "$response" | sed -nE 's|.*Referer":"([^"]*)".*|\1|p') && printf '%s\n' "m3u8_refr >$m3u8_refr" >"$cache_dir/m3u8_refr"
-            extract_link=$(printf "%s" "$episode_link" | head -1 | cut -d'>' -f2)
-            relative_link=$(printf "%s" "$extract_link" | sed 's|[^/]*$||')
-            m3u8_streams="$(curl -e "$m3u8_refr" -s "$extract_link" -A "$agent")"
-            printf "%s" "$m3u8_streams" | grep -q "EXTM3U" && printf "%s" "$m3u8_streams" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' |
-                sed "s|>|cc>${relative_link}|g" | sort -nr
-            printf '%s' "$response" | sed -nE 's|.*"subtitles":\[\{"lang":"en","label":"English","default":"default","src":"([^"]*)".*|subtitle >\1|p' >"$cache_dir/suburl"
+        Okru*)
+            # ok.ru embeds - try yt-dlp as it sometimes works
+            _direct=$(timeout 10 yt-dlp --get-url "$_embed_url" 2>/dev/null | head -1)
+            printf '%s' "$_direct"
             ;;
-        *) [ -n "$episode_link" ] && printf "%s\n" "$episode_link" ;;
+        Maru*)
+            # mail.ru embeds - try yt-dlp
+            _direct=$(timeout 10 yt-dlp --get-url "$_embed_url" 2>/dev/null | head -1)
+            printf '%s' "$_direct"
+            ;;
+        *)
+            # Generic: try to find direct video URL in the embed page
+            _page=$(curl -sL "$_embed_url" -A "$agent" -e "https://tioanime.com/" --max-time 10)
+            _direct=$(printf '%s' "$_page" | grep -oE 'https?://[^"]+\.(mp4|m3u8)[^"]*' | head -1)
+            # If no direct URL found, try yt-dlp as last resort
+            [ -z "$_direct" ] && _direct=$(timeout 10 yt-dlp --get-url "$_embed_url" 2>/dev/null | head -1)
+            printf '%s' "$_direct"
+            ;;
     esac
-
-    printf "%s" "$*" | grep -q "tools.fast4speed.rsvp" && printf "%s\n" "Yt >$*"
-    printf "\033[1;32m%s\033[0m Links Fetched\n" "$provider_name" 1>&2
 }
 
-# initialises provider_name and provider_id. First argument is the provider name, 2nd is the regex that matches that provider's link
-provider_init() {
-    provider_name=$1
-    provider_id=$(printf "%s" "$resp" | sed -n "$2" | head -1 | cut -d':' -f2 | sed 's/../&\
-/g' | sed 's/^79$/A/g;s/^7a$/B/g;s/^7b$/C/g;s/^7c$/D/g;s/^7d$/E/g;s/^7e$/F/g;s/^7f$/G/g;s/^70$/H/g;s/^71$/I/g;s/^72$/J/g;s/^73$/K/g;s/^74$/L/g;s/^75$/M/g;s/^76$/N/g;s/^77$/O/g;s/^68$/P/g;s/^69$/Q/g;s/^6a$/R/g;s/^6b$/S/g;s/^6c$/T/g;s/^6d$/U/g;s/^6e$/V/g;s/^6f$/W/g;s/^60$/X/g;s/^61$/Y/g;s/^62$/Z/g;s/^59$/a/g;s/^5a$/b/g;s/^5b$/c/g;s/^5c$/d/g;s/^5d$/e/g;s/^5e$/f/g;s/^5f$/g/g;s/^50$/h/g;s/^51$/i/g;s/^52$/j/g;s/^53$/k/g;s/^54$/l/g;s/^55$/m/g;s/^56$/n/g;s/^57$/o/g;s/^48$/p/g;s/^49$/q/g;s/^4a$/r/g;s/^4b$/s/g;s/^4c$/t/g;s/^4d$/u/g;s/^4e$/v/g;s/^4f$/w/g;s/^40$/x/g;s/^41$/y/g;s/^42$/z/g;s/^08$/0/g;s/^09$/1/g;s/^0a$/2/g;s/^0b$/3/g;s/^0c$/4/g;s/^0d$/5/g;s/^0e$/6/g;s/^0f$/7/g;s/^00$/8/g;s/^01$/9/g;s/^15$/-/g;s/^16$/./g;s/^67$/_/g;s/^46$/~/g;s/^02$/:/g;s/^17$/\//g;s/^07$/?/g;s/^1b$/#/g;s/^63$/\[/g;s/^65$/\]/g;s/^78$/@/g;s/^19$/!/g;s/^1c$/$/g;s/^1e$/&/g;s/^10$/\(/g;s/^11$/\)/g;s/^12$/*/g;s/^13$/+/g;s/^14$/,/g;s/^03$/;/g;s/^05$/=/g;s/^1d$/%/g' | tr -d '\n' | sed "s/\/clock/\/clock\.json/")
-}
-
-# generates links based on given provider
-generate_link() {
-    case $1 in
-        1) provider_init "wixmp" "/Default :/p" ;;    # wixmp(default)(m3u8)(multi) -> (mp4)(multi)
-        2) provider_init "youtube" "/Yt-mp4 :/p" ;;   # youtube(mp4)(single)
-        3) provider_init "sharepoint" "/S-mp4 :/p" ;; # sharepoint(mp4)(single)
-        *) provider_init "hianime" "/Luf-Mp4 :/p" ;;  # hianime(m3u8)(multi)
-    esac
-    [ -n "$provider_id" ] && get_links "$provider_id"
-}
-
-select_quality() {
-    # removing urls which have soft subs to avoid playing on android, iSH and vlc (m3u8 streams don't get correct referrer)
-    printf '%s' "$player_function" | cut -f1 -d" " | grep -qE '(android|iSH|vlc)' && links=$(printf '%s' "$links" | sed '/cc>/d;/subtitle >/d;/m3u8_refr >/d')
-    printf '%s' "$player_function" | cut -f1 -d" " | grep -qE '(android|iSH)' && links=$(printf '%s' "$links" | sed '/Yt >/d')
-    case "$1" in
-        best) result=$(printf "%s" "$links" | head -n1) ;;
-        worst) result=$(printf "%s" "$links" | grep -E '^[0-9]{3,4}' | tail -n1) ;;
-        *) result=$(printf "%s" "$links" | grep -m 1 "$1") ;;
-    esac
-    [ -z "$result" ] && printf "Specified quality not found, defaulting to best\n" 1>&2 && result=$(printf "%s" "$links" | head -n1)
-
-    # add refr,sub flags for m3u8 and refr flag for yt
-    printf '%s' "$result" | grep -q "cc>" && subtitle="$(printf '%s' "$links" | sed -nE 's|subtitle >(.*)|\1|p')" &&
-        [ -n "$subtitle" ] && subs_flag="--sub-file=$subtitle"
-    printf '%s' "$result" | grep -q "cc>" && m3u8_refr="$(printf '%s' "$links" | sed -nE 's|m3u8_refr >(.*)|\1|p')" && refr_flag="--referrer=$m3u8_refr"
-    printf "%s" "$result" | grep -q "tools.fast4speed.rsvp" && refr_flag="--referrer=$allanime_refr"
-
-    ! (printf '%s' "$result" | grep -qE "(cc>|tools.fast4speed.rsvp)") && unset refr_flag
-    ! (printf '%s' "$result" | grep -q "cc>") && unset subs_flag
-    episode=$(printf "%s" "$result" | cut -d'>' -f2)
-}
-
-# gets embed urls, collects direct links into provider files, selects one with desired quality into $episode
-get_episode_url() {
-    # get the embed urls of the selected episode
-    #shellcheck disable=SC2016
-    episode_embed_gql='query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
-
-    resp=$(curl -e "$allanime_refr" -s -G "${allanime_api}/api" --data-urlencode "variables={\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"}" --data-urlencode "query=$episode_embed_gql" -A "$agent" | tr '{}' '\n' | sed 's|\\u002F|\/|g;s|\\||g' | sed -nE 's|.*sourceUrl":"--([^"]*)".*sourceName":"([^"]*)".*|\2 :\1|p')
-    # generate links into sequential files
-    cache_dir="$(mktemp -d)"
-    providers="1 2 3 4"
-    for provider in $providers; do
-        generate_link "$provider" >"$cache_dir"/"$provider" &
+# Try servers in priority order until one returns a playable URL
+# Sets $episode and $refr_flag
+# $1 = server_data (Name\tURL lines)
+try_servers() {
+    _all_servers="$1"
+    # Order: YourUpload first (most reliable), then Okru, Maru, then others
+    _ordered=""
+    for _p in YourUpload Okru Maru; do
+        _matched=$(printf '%s\n' "$_all_servers" | grep -i "$_p")
+        [ -n "$_matched" ] && _ordered="${_ordered}${_matched}
+"
     done
-    wait
-    # select the link with matching quality
-    links=$(cat "$cache_dir"/* | sort -g -r -s)
-    rm -r "$cache_dir"
-    select_quality "$quality"
-    if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
-        [ -z "$episode" ] && die "Episode is released, but no valid sources!"
+    _rest=$(printf '%s\n' "$_all_servers" | grep -viE 'yourupload|okru|maru|mega|netu|streamsb')
+    [ -n "$_rest" ] && _ordered="${_ordered}${_rest}
+"
+    # Also add Mega/Netu/StreamSB at the end as last resort
+    _last=$(printf '%s\n' "$_all_servers" | grep -iE 'mega|netu|streamsb')
+    [ -n "$_last" ] && _ordered="${_ordered}${_last}
+"
+
+    printf '%s\n' "$_ordered" | grep -v '^$' | while IFS='	' read -r _name _url; do
+        [ -z "$_url" ] && continue
+        printf "\33[2K\r\033[1;33mProbando %s...\033[0m" "$_name" >&2
+        _resolved=$(resolve_video_url "$_name" "$_url")
+        if [ -n "$_resolved" ]; then
+            printf '%s\t%s\n' "$_name" "$_resolved"
+            return 0
+        fi
+    done
+}
+
+select_server() {
+    # Fetch episode page and extract servers
+    _html=$(curl -s "https://tioanime.com/ver/$id-$ep_no" -A "$agent")
+    _servers=$(printf '%s' "$_html" | extract_servers)
+
+    [ -z "$_servers" ] && printf "\033[1;31mNo se encontraron servidores disponibles para este episodio.\033[0m\n" && return 1
+
+    # Build menu: Index\tURL\tName
+    _menu=$(printf '%s\n' "$_servers" | awk -F'\t' '{printf "%d\t%s\t%s\n", NR, $2, $1}')
+
+    printf "\n\033[1;36mSeleccionando servidor para el episodio %s...\033[0m\n" "$ep_no"
+    _result=$(printf '%s' "$_menu" | nth "Seleccionar servidor: ")
+    [ -z "$_result" ] && return 1
+
+    _embed_url=$(printf '%s' "$_result" | cut -f1)
+    _name=$(printf '%s' "$_result" | cut -f2)
+
+    printf "\33[2K\r\033[1;33mResolviendo %s...\033[0m" "$_name"
+    episode=$(resolve_video_url "$_name" "$_embed_url")
+    set_referrer "$_name"
+
+    if [ -n "$episode" ]; then
+        printf "\33[2K\r\033[1;32m¡Cambiado a servidor: %s!\033[0m\n" "$_name"
     else
-        [ -z "$episode" ] && die "Episode not released!"
+        printf "\33[2K\r\033[1;31m%s no tiene video directo disponible.\033[0m\n" "$_name"
+        return 1
     fi
+}
+
+# gets video URL for the selected episode
+get_episode_url() {
+    printf "\33[2K\r\033[1;36mBuscando servidores para el episodio %s...\033[0m\n" "$ep_no"
+    _html=$(curl -s "https://tioanime.com/ver/$id-$ep_no" -A "$agent")
+
+    # Extract servers: "Name\tURL"
+    server_data=$(printf '%s' "$_html" | extract_servers)
+
+    if [ -z "$server_data" ]; then
+        if printf "%s\n" "$ep_list" | grep -q "^${ep_no}$"; then
+            die "El episodio existe pero no se encontraron fuentes válidas."
+        else
+            die "¡Episodio no disponible!"
+        fi
+    fi
+
+    # Try servers until one works (resolves to direct video URL)
+    _result=$(try_servers "$server_data")
+
+    if [ -n "$_result" ]; then
+        _server_name=$(printf '%s' "$_result" | cut -f1)
+        episode=$(printf '%s' "$_result" | cut -f2)
+        set_referrer "$_server_name"
+    fi
+
+    [ -z "$episode" ] && die "No se pudo obtener un video directo de ningún servidor."
+    printf "\33[2K\r\033[1;32m¡Servidor: %s ✓\033[0m\n" "${_server_name:-Auto}"
 }
 
 # search the query and give results
 search_anime() {
-    #shellcheck disable=SC2016
-    search_gql='query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name availableEpisodes __typename } }}'
-
-    curl -e "$allanime_refr" -s -G "${allanime_api}/api" --data-urlencode "variables={\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"}" --data-urlencode "query=$search_gql" -A "$agent" | sed 's|Show|\
-| g' | sed -nE "s|.*_id\":\"([^\"]*)\",\"name\":\"(.+)\",.*${mode}\":([1-9][^,]*).*|\1	\2 (\3 episodes)|p" | sed 's/\\"//g'
+    # TioAnime search uses directory with q parameter
+    # Extraction optimized to get both slug and title from the same page
+    curl -s "https://tioanime.com/directorio?q=$*" -A "$agent" | grep -oP '<a href="/anime/\K[^"]+|class="title">\K[^<]+' | paste -d '\t' - - | sed "s/&#039;/'/g;s/&quot;/\"/g"
 }
 
 time_until_next_ep() {
@@ -258,11 +310,8 @@ time_until_next_ep() {
 
 # get the episodes list of the selected anime
 episodes_list() {
-    #shellcheck disable=SC2016
-    episodes_list_gql='query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}'
-
-    curl -e "$allanime_refr" -s -G "${allanime_api}/api" --data-urlencode "variables={\"showId\":\"$*\"}" --data-urlencode "query=$episodes_list_gql" -A "$agent" | sed -nE "s|.*$mode\":\[([0-9.\",]*)\].*|\1|p" | sed 's|,|\
-|g; s|"||g' | sort -n -k 1
+    # Get total episodes from the var episodes array in JS
+    curl -s "https://tioanime.com/anime/$*" -A "$agent" | grep -oP 'var episodes = \[\K[^]]+' | tr ',' '\n' | sort -n
 }
 
 # PLAYING
@@ -317,9 +366,13 @@ play_episode() {
             ;;
         mpv*)
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $skip_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag >/dev/null 2>&1 &
+                printf "\33[2K\r\033[1;32m¡Cargando el video! 📺 Por favor espera...\033[0m\n"
+                # Use --no-terminal and redirect stdin to </dev/null to prevent freezing fzf
+                nohup "$player_function" $skip_flag --no-terminal --force-media-title="${allanime_title} Episode ${ep_no}" "$episode" $subs_flag "$refr_flag" </dev/null >/dev/null 2>&1 &
+                sleep 1
             else
-                $player_function $skip_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
+                printf "\33[2K\r\033[1;32m¡Reproduciendo ahora! 🎬\033[1;37m [%s]\033[0m\n" "$ep_no"
+                "$player_function" $skip_flag $subs_flag "$refr_flag" --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
@@ -369,7 +422,7 @@ play() {
         for i in $range; do
             tput clear
             ep_no=$i
-            printf "\33[2K\r\033[1;34mPlaying episode %s...\033[0m\n" "$ep_no"
+            printf "\33[2K\r\033[1;34mReproduciendo episodio %s...\033[0m\n" "$ep_no"
             [ "$i" = "$end" ] && unset range
             play_episode
         done
@@ -384,8 +437,8 @@ play() {
 
 # setup
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
-allanime_refr="https://allmanga.to"
-allanime_base="allanime.day"
+allanime_refr="https://tioanime.com"
+allanime_base="tioanime.com"
 allanime_api="https://api.${allanime_base}"
 mode="${ANI_CLI_MODE:-sub}"
 download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
@@ -493,6 +546,10 @@ dep_ch "curl" "sed" "grep" || true
 [ "$skip_intro" = 1 ] && (dep_ch "ani-skip" || true)
 dep_ch "fzf" || true
 case "$player_function" in
+    mpv*)
+        dep_ch "$player_function"
+        command -v yt-dlp >/dev/null || command -v youtube-dl >/dev/null || die "yt-dlp or youtube-dl not found. Please install one of them to stream videos (sudo pacman -S yt-dlp)."
+        ;;
     debug) ;;
     download) dep_ch "ffmpeg" "aria2c" ;;
     android*) printf "\33[2K\rChecking of players on Android is disabled\n" ;;
@@ -507,7 +564,7 @@ case "$search" in
         anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
         wait
         [ -z "$anime_list" ] && die "No unwatched series in history!"
-        [ -z "${index##*[!0-9]*}" ] && id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f1)
+        [ -z "${index##*[!0-9]*}" ] && id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: " | cut -f1)
         [ -z "${index##*[!0-9]*}" ] || id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f1)
         [ -z "$id" ] && exit 1
         title=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed 's/ - episode.*//')
@@ -518,10 +575,10 @@ case "$search" in
     *)
         if [ "$use_external_menu" = "0" ]; then
             while [ -z "$query" ]; do
-                printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+                printf "\33[2K\r\033[1;36mBuscar anime: \033[0m" && read -r query
             done
         else
-            [ -z "$query" ] && query=$(printf "" | external_menu "" "Search anime: " "$external_menu_args")
+            [ -z "$query" ] && query=$(printf "" | external_menu "" "Buscar anime: " "$external_menu_args")
             [ -z "$query" ] && exit 1
         fi
         # for checking new releases by specifying anime name
@@ -531,13 +588,13 @@ case "$search" in
         anime_list=$(search_anime "$query")
         [ -z "$anime_list" ] && die "No results found!"
         [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Seleccionar anime: ")
         [ -z "$result" ] && exit 1
         title=$(printf "%s" "$result" | cut -f2)
         allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
         id=$(printf "%s" "$result" | cut -f1)
         ep_list=$(episodes_list "$id")
-        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
+        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Seleccionar episodio: " "$multi_selection_flag")
         [ -z "$ep_no" ] && exit 1
         ;;
 esac
@@ -552,15 +609,14 @@ tput sc
 play
 [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
 
-while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Playing episode $ep_no of $title... "); do
+while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Reproduciendo episodio $ep_no de $title... "); do
     case "$cmd" in
         next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
         replay) episode="$replay" ;;
         previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
-        select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag") ;;
+        select) ep_no=$(printf "%s" "$ep_list" | nth "Seleccionar episodio: " "$multi_selection_flag") ;;
         change_quality)
-            new_quality="$(printf "%s" "$links" | launcher | cut -d\> -f1)"
-            select_quality "$new_quality"
+            select_server
             ;;
         *) exit 0 ;;
     esac
